@@ -1,0 +1,53 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "sh scripts/dev-setup.sh" }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(sh tests/run.sh:*)",
+      "Bash(sudo sh tests/integration.sh)",
+      "Bash(sh scripts/check-secrets.sh:*)",
+      "Bash(sh scripts/dev-setup.sh)",
+      "Bash(shellcheck:*)",
+      "Bash(busybox ash -n:*)",
+      "Bash(node --check:*)",
+      "Bash(jq:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git checkout:*)",
+      "Bash(git switch:*)",
+      "Bash(git push origin:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr checks:*)",
+      "Bash(gh run view:*)",
+      "Bash(gh run list:*)"
+    ],
+    "deny": [
+      "Read(./**/*.conf)",
+      "Read(./**/*.key)",
+      "Read(./**/*.psk)",
+      "Read(./**/.env*)",
+      "Bash(git commit --no-verify:*)",
+      "Bash(git commit -n:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git config core.hooksPath:*)",
+      "Bash(gh pr merge:*)",
+      "Bash(gh secret:*)",
+      "Bash(gh repo delete:*)",
+      "Bash(gh release:*)",
+      "Bash(git tag:*)",
+      "Bash(git push origin v*)"
+    ]
+  }
+}

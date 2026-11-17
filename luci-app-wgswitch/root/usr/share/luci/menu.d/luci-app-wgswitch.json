@@ -1,0 +1,14 @@
+{
+	"admin/network/vpn": {
+		"title": "VPN",
+		"order": 65,
+		"action": {
+			"type": "view",
+			"path": "wgswitch/main"
+		},
+		"depends": {
+			"acl": [ "luci-app-wgswitch" ],
+			"uci": { "wgswitch": true }
+		}
+	}
+}

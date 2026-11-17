@@ -1,0 +1,22 @@
+{
+	"luci-app-wgswitch": {
+		"description": "Grant access to wgswitch (WireGuard profile switcher)",
+		"read": {
+			"file": {
+				"/usr/sbin/wgswitch status --json": [ "exec" ],
+				"/usr/sbin/wgswitch list --json": [ "exec" ]
+			},
+			"uci": [ "wgswitch" ]
+		},
+		"write": {
+			"file": {
+				"/usr/sbin/wgswitch": [ "exec" ],
+				"/usr/sbin/wgswitch *": [ "exec" ],
+				"/tmp/wgswitch-upload.conf": [ "write" ],
+				"/tmp/wgswitch-edit.conf": [ "write" ]
+			},
+			"cgi-io": [ "upload" ],
+			"uci": [ "wgswitch" ]
+		}
+	}
+}

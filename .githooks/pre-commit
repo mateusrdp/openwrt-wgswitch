@@ -1,0 +1,4 @@
+#!/bin/sh
+# Installed by setup-repo.sh via `git config core.hooksPath .githooks`.
+# Blocks commits containing WireGuard configs, keys or credentials.
+exec sh "$(git rev-parse --show-toplevel)/scripts/check-secrets.sh" --staged

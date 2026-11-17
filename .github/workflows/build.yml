@@ -1,0 +1,172 @@
+name: build
+
+# checks + integration test + .apk build on every push and PR.
+# On a tag (v*): also a GitHub Release with the .apk files, and the signed
+# apk feed published to GitHub Pages:
+#   https://<owner>.github.io/<repo>/packages.adb
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  OPENWRT_VERSION: 25.12.6
+  OPENWRT_SERIES: '25.12'
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: No WireGuard configs, keys or credentials - ever (whole history)
+        run: sh scripts/check-secrets.sh --history
+
+      - name: Tools
+        run: sudo apt-get update -q && sudo apt-get install -y -q busybox shellcheck jq
+
+      - name: shellcheck
+        run: |
+          shellcheck -s sh -x -P wgswitch/files wgswitch/files/wgswitch wgswitch/files/lib.sh
+          shellcheck -s sh scripts/*.sh tests/run.sh tests/integration.sh setup-repo.sh setup-claude.sh .githooks/pre-commit
+
+      - name: BusyBox ash syntax
+        run: for f in wgswitch/files/wgswitch wgswitch/files/lib.sh; do busybox ash -n "$f"; done
+
+      - name: JSON and JavaScript syntax
+        run: |
+          for f in luci-app-wgswitch/root/usr/share/*/*/*.json .claude/settings.json; do jq empty "$f"; done
+          { echo '(function(){'; cat luci-app-wgswitch/htdocs/luci-static/resources/view/wgswitch/main.js; echo '})'; } > /tmp/view.js
+          node --check /tmp/view.js
+
+      - name: Unit / flow tests (BusyBox ash, simulated network)
+        run: sh tests/run.sh -v
+
+  integration:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: sudo apt-get update -q && sudo apt-get install -y -q busybox wireguard-tools iproute2 jq
+      - name: Real WireGuard handshake test (network namespaces)
+        run: sudo sh tests/integration.sh
+
+  build:
+    needs: checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Pick the OpenWrt SDK image
+        id: sdk
+        run: |
+          # The packages are architecture-independent (PKGARCH:=all), so any
+          # 25.12 SDK builds them for every device. Image tag naming has
+          # varied between releases - use the first one that exists.
+          for t in "x86_64-${OPENWRT_VERSION}" "x86_64-v${OPENWRT_VERSION}" "x86_64-openwrt-${OPENWRT_SERIES}" "x86_64-${OPENWRT_SERIES}"; do
+            if curl -fsS "https://hub.docker.com/v2/repositories/openwrt/sdk/tags/$t" >/dev/null 2>&1; then
+              echo "Using openwrt/sdk:$t"; echo "arch=$t" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+          done
+          echo "::error::no openwrt/sdk image found for ${OPENWRT_VERSION}"; exit 1
+
+      - name: Signing key sanity (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          APK_SIGN_KEY: ${{ secrets.APK_SIGN_KEY }}
+        run: |
+          [ -n "$APK_SIGN_KEY" ] || { echo "::error::secret APK_SIGN_KEY is not set (run setup-repo.sh)"; exit 1; }
+          printf '%s\n' "$APK_SIGN_KEY" | openssl ec -pubout 2>/dev/null > /tmp/derived.pem
+          diff -q /tmp/derived.pem keys/wgswitch.pem || { echo "::error::APK_SIGN_KEY does not match keys/wgswitch.pem"; exit 1; }
+
+      - name: Build with the OpenWrt SDK
+        uses: openwrt/gh-action-sdk@v7
+        env:
+          ARCH: ${{ steps.sdk.outputs.arch }}
+          FEEDNAME: wgswitch
+          PACKAGES: wgswitch luci-app-wgswitch
+          INDEX: 1
+          PRIVATE_KEY: ${{ secrets.APK_SIGN_KEY }}
+          NO_SHFMT_CHECK: 1
+          V: s
+
+      - name: Collect the feed
+        run: |
+          mkdir -p dist
+          find bin/packages -path '*/wgswitch/*' -type f \( -name '*.apk' -o -name 'packages.adb' -o -name 'index.json' \) -exec cp {} dist/ \;
+          ls -la dist
+          ls dist/wgswitch-*.apk dist/luci-app-wgswitch-*.apk >/dev/null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: feed
+          path: dist/
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-logs
+          path: logs/
+          if-no-files-found: ignore
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [ build, integration ]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: feed
+          path: dist
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/*.apk keys/wgswitch.pem --title "${GITHUB_REF_NAME}" --generate-notes
+
+  pages:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [ build, integration ]
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: feed
+          path: site
+      - name: Feed page
+        run: |
+          cp keys/wgswitch.pem site/
+          base="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
+          cat > site/index.html <<EOF
+          <!doctype html><meta charset="utf-8"><title>wgswitch apk feed</title>
+          <h1>wgswitch apk feed (OpenWrt 25.12+)</h1>
+          <p>On the router:</p>
+          <pre>wget -O /etc/apk/keys/wgswitch.pem ${base}/wgswitch.pem
+          echo '${base}/packages.adb' > /etc/apk/repositories.d/wgswitch.list
+          apk update &amp;&amp; apk add wgswitch luci-app-wgswitch</pre>
+          <p>Release: ${GITHUB_REF_NAME}. Source: <a href="https://github.com/${GITHUB_REPOSITORY}">${GITHUB_REPOSITORY}</a></p>
+          EOF
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4

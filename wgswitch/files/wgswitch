@@ -1,0 +1,506 @@
+#!/bin/sh
+# =============================================================================
+# wgswitch - manage, test and switch WireGuard client profiles on OpenWrt.
+# See `wgswitch help`. Library: /usr/lib/wgswitch/lib.sh
+# =============================================================================
+WGS_VERSION="@VERSION@"
+WGS_LIB="${WGSWITCH_LIB:-/usr/lib/wgswitch/lib.sh}"
+# shellcheck source=lib.sh
+. "$WGS_LIB" || { echo "wgswitch: cannot load $WGS_LIB" >&2; exit 1; }
+
+usage() {
+    cat <<'EOF'
+Usage: wgswitch <command> [args]
+
+Profiles (.conf files in conf_dir, default /etc/wireguard):
+  list [--json]                 list profiles with their last test result
+  show <name> [--secrets]       print a profile (keys hidden unless --secrets)
+  add <file> [name] [--replace] validate and install a .conf as a profile
+  edit <name>                   edit a profile in $EDITOR, validated on save
+  remove <name> [--force]       delete a profile (refuses the active one)
+
+Connection:
+  connect <name>                connect (disconnects the current one first)
+  connect --best                test all profiles, connect to the fastest
+  connect ... --no-hook         don't run the connect hook this time
+  reconnect                     reconnect the current profile
+  disconnect                    stop the VPN: traffic goes out directly
+  (connect/reconnect/disconnect/test accept --bg: hand the job to the
+   background service and return immediately - used by LuCI)
+  status [--json]               current server, handshake, RTT, loss, state
+
+Testing:
+  test [--bg] [name...]         handshake-test profiles (default: all)
+  best                          print the fastest profile from the last test
+
+Kill switch (what happens if the connected tunnel dies):
+  killswitch [block|fastest|direct]   show or set the mode
+    block    keep the tunnel as the only path: no internet until it recovers
+    fastest  switch to the fastest other profile that answers a test
+    direct   disconnect and let traffic go out directly
+
+Configuration: /etc/config/wgswitch (uci), or LuCI > Network > VPN.
+EOF
+}
+
+need_root() { [ "$(id -u)" = 0 ] || die "must be run as root"; }
+
+# ---------------------------------------------------------------------------
+# runtime state (tmpfs): ok | degraded | blocked | failover | fallback-direct | disconnected
+# ---------------------------------------------------------------------------
+rt_set() { printf '%s %s\n' "$1" "$(now)" > "$WGS_STATE/runtime"; }
+rt_get() { cut -d' ' -f1 "$WGS_STATE/runtime" 2>/dev/null; }
+
+# ---------------------------------------------------------------------------
+# connect / disconnect (caller holds the main lock)
+# ---------------------------------------------------------------------------
+do_connect() {  # do_connect <name> <run_hook 0|1>
+    profile_load "$1" || { log_err "cannot connect to '$1': $P_ERR"; return 1; }
+    [ -z "$P_IGNORED" ] || log_warn "'$1': ignoring wg-quick keys not used on OpenWrt: $P_IGNORED (scripts like PostUp are never run)"
+    _dc_host=$P_EP_HOST
+    if _dc_ip=$(endpoint_ip "$P_EP_HOST"); then _dc_host=$_dc_ip; fi
+    _dc_prev=$(state_get profile)
+    _dc_prev_en=$(state_get enabled)
+    uci export network > "$WGS_RUN/network.bak" 2>/dev/null || { log_err "cannot back up network config"; return 1; }
+
+    _dc_msg="connecting to '$1' ($(ep_display "$P_EP_HOST" "$P_EP_PORT")) on interface '$IFACE'"
+    [ -z "$_dc_prev" ] || _dc_msg="$_dc_msg, replacing '$_dc_prev'"
+    log_info "$_dc_msg"
+    net_apply_profile "$_dc_host"
+    uci commit network
+    _dc_t=$(now)
+    ifup "$IFACE" 2>/dev/null   # ifup = network reload + down + up: the old peer is gone first
+
+    if ! wait_handshake "$IFACE" "$_dc_t" "$CONNECT_TIMEOUT"; then
+        log_err "no handshake with '$1' within ${CONNECT_TIMEOUT}s - restoring the previous state"
+        uci import network < "$WGS_RUN/network.bak" 2>/dev/null && uci commit network
+        if [ "$_dc_prev_en" = 1 ]; then ifup "$IFACE" 2>/dev/null; else ifdown "$IFACE" 2>/dev/null; fi
+        results_put "$1" fail "" "connect: no handshake"
+        rm -f "$WGS_RUN/network.bak"
+        return 1
+    fi
+    rm -f "$WGS_RUN/network.bak"
+    state_set profile "$1" enabled 1 event "connected to $1 at $(date '+%F %T')"
+    rt_set ok
+    log_info "connected to '$1'"
+    if [ "$_dc_prev_en" != 1 ] && [ "$2" = 1 ]; then
+        run_hook connect || { log_warn "tunnel is up, but the connect hook failed"; return 3; }
+    fi
+    return 0
+}
+
+do_disconnect() {  # do_disconnect <run_hook 0|1> <event text>
+    _dd_rc=0
+    if [ "$1" = 1 ]; then run_hook disconnect || _dd_rc=3; fi
+    if uci -q get "network.$IFACE" >/dev/null 2>&1; then
+        uci set "network.$IFACE.auto=0"
+        uci commit network
+    fi
+    ifdown "$IFACE" 2>/dev/null
+    state_set enabled 0 event "$2"
+    rt_set disconnected
+    log_info "$2"
+    return "$_dd_rc"
+}
+
+main_lock() { lock_wait main 120 || die "another wgswitch operation is in progress"; }
+
+# ---------------------------------------------------------------------------
+# background requests: `wgswitch connect --bg X` etc. queue the job for the
+# procd-managed daemon instead of running it here. LuCI uses this so that a
+# long connect (handshake wait + hook) is never cut short by rpcd's exec
+# timeout halfway through changing the network.
+# ---------------------------------------------------------------------------
+enqueue() {  # enqueue <words...>
+    load_config
+    _eq_pid=$(cat "$WGS_RUN/daemon.pid" 2>/dev/null)
+    [ -n "$_eq_pid" ] && kill -0 "$_eq_pid" 2>/dev/null \
+        || die "the wgswitch service is not running (/etc/init.d/wgswitch start)"
+    mkdir -p "$WGS_RUN/queue"
+    _eq_f="$WGS_RUN/queue/$(now).$$"
+    printf '%s\n' "$*" > "$_eq_f.tmp" && mv "$_eq_f.tmp" "$_eq_f"
+    kill -USR1 "$_eq_pid" 2>/dev/null
+    echo "queued: $*"
+}
+busy_set() { if [ -n "$1" ]; then printf '%s\n' "$1" > "$WGS_STATE/busy"; else rm -f "$WGS_STATE/busy"; fi; }
+
+daemon_queue() {  # run queued requests, oldest first (daemon context)
+    for _qf in "$WGS_RUN"/queue/*; do
+        [ -f "$_qf" ] || continue
+        case "$_qf" in *.tmp) continue ;; esac
+        _q=$(cat "$_qf"); rm -f "$_qf"
+        # shellcheck disable=SC2086
+        set -- $_q
+        _q_cmd=${1:-}; [ $# -gt 0 ] && shift
+        case "$_q_cmd" in
+            connect)
+                valid_name "${1:-}" || continue
+                busy_set "connecting to $1"
+                lock_wait main 120 && { do_connect "$1" 1; lock_release main; }
+                ;;
+            reconnect)
+                _q_p=$(state_get profile); [ -n "$_q_p" ] || continue
+                busy_set "reconnecting to $_q_p"
+                lock_wait main 120 && { do_connect "$_q_p" 1; lock_release main; }
+                ;;
+            disconnect)
+                busy_set "disconnecting"
+                lock_wait main 120 && { do_disconnect 1 "disconnected by user at $(date '+%F %T')"; lock_release main; }
+                ;;
+            test)
+                _q_ok=; for _n in "$@"; do valid_name "$_n" && _q_ok="$_q_ok $_n"; done
+                # shellcheck disable=SC2086
+                # shellcheck disable=SC2046
+                [ -n "$_q_ok" ] || set -- $(profiles)
+                # shellcheck disable=SC2086
+                [ -n "$_q_ok" ] && set -- $_q_ok
+                printf 'queued 0 %s %s\n' "$#" "$(now)" > "$WGS_PROGRESS"
+                ( test_run "$@" ) >/dev/null 2>&1 &
+                ;;
+        esac
+        busy_set ""
+    done
+}
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+cmd_connect() {
+    need_root
+    _cc_bg=0; _cc_hook=1; _cc_best=0; _cc_name=
+    for _a in "$@"; do
+        case "$_a" in
+            --bg) _cc_bg=1 ;;
+            --no-hook) _cc_hook=0 ;;
+            --best) _cc_best=1 ;;
+            -*) die "unknown option $_a" ;;
+            *) _cc_name=$_a ;;
+        esac
+    done
+    if [ "$_cc_bg" = 1 ]; then
+        valid_name "$_cc_name" || die "usage: wgswitch connect --bg <name>"
+        enqueue connect "$_cc_name"; return
+    fi
+    load_config
+    if [ "$_cc_best" = 1 ]; then
+        # shellcheck disable=SC2046
+        ( test_run $(profiles) ) >/dev/null || die "test failed"
+        _cc_name=$(best_result "") ; [ -n "$_cc_name" ] || die "no profile answered the test"
+    fi
+    [ -n "$_cc_name" ] || die "usage: wgswitch connect <name> | --best  [--no-hook] [--bg]"
+    main_lock
+    do_connect "$_cc_name" "$_cc_hook"; _cc_rc=$?
+    lock_release main
+    return "$_cc_rc"
+}
+
+cmd_reconnect() {
+    need_root
+    if [ "${1:-}" = "--bg" ]; then enqueue reconnect; return; fi
+    load_config
+    _rc_p=$(state_get profile); [ -n "$_rc_p" ] || die "no current profile"
+    main_lock; do_connect "$_rc_p" 1; _rc_rc=$?; lock_release main
+    return "$_rc_rc"
+}
+
+cmd_disconnect() {
+    need_root
+    if [ "${1:-}" = "--bg" ]; then enqueue disconnect; return; fi
+    load_config
+    main_lock
+    do_disconnect 1 "disconnected by user at $(date '+%F %T')"; _cd_rc=$?
+    lock_release main
+    return "$_cd_rc"
+}
+
+cmd_killswitch() {
+    load_config
+    if [ -z "${1:-}" ]; then echo "$KILLSWITCH"; return 0; fi
+    need_root
+    case "$1" in block|fastest|direct) ;; *) die "mode must be block, fastest or direct" ;; esac
+    uci set "wgswitch.main.killswitch=$1"; uci commit wgswitch
+    echo "kill switch: $1"
+}
+
+cmd_add() {
+    need_root; load_config
+    _ca_replace=0; _ca_file=; _ca_name=
+    for _a in "$@"; do
+        case "$_a" in
+            --replace|--force) _ca_replace=1 ;;
+            *) if [ -z "$_ca_file" ]; then _ca_file=$_a; else _ca_name=$_a; fi ;;
+        esac
+    done
+    [ -n "$_ca_file" ] && [ -f "$_ca_file" ] || die "usage: wgswitch add <file.conf> [name] [--replace]"
+    [ -n "$_ca_name" ] || _ca_name=$(basename "$_ca_file")
+    _ca_name=$(sanitize_name "$_ca_name")
+    valid_name "$_ca_name" || die "cannot make a valid profile name from '$_ca_name'"
+    conf_parse "$_ca_file" || die "cannot read $_ca_file"
+    _ca_err=$(conf_validate) || die "$_ca_file is not a usable WireGuard client config: $_ca_err"
+    _ca_dst=$(profile_path "$_ca_name")
+    [ ! -e "$_ca_dst" ] || [ "$_ca_replace" = 1 ] || die "profile '$_ca_name' already exists (use --replace)"
+    mkdir -p "$CONF_DIR" && chmod 700 "$CONF_DIR"
+    ( umask 077; cp "$_ca_file" "$_ca_dst.tmp.$$" ) && chmod 600 "$_ca_dst.tmp.$$" && mv "$_ca_dst.tmp.$$" "$_ca_dst" \
+        || { rm -f "$_ca_dst.tmp.$$"; die "cannot write $_ca_dst"; }
+    [ -z "$P_IGNORED" ] || log_warn "note: these wg-quick keys are ignored on OpenWrt: $P_IGNORED"
+    echo "added profile '$_ca_name' ($(ep_display "$P_EP_HOST" "$P_EP_PORT"))"
+    if [ "$(state_get profile)" = "$_ca_name" ] && [ "$(state_get enabled)" = 1 ]; then
+        echo "this is the connected profile - run 'wgswitch reconnect' to apply the change"
+    fi
+}
+
+cmd_show() {
+    load_config
+    _cs_n="${1:-}"; valid_name "$_cs_n" || die "usage: wgswitch show <name> [--secrets]"
+    _cs_f=$(profile_path "$_cs_n"); [ -f "$_cs_f" ] || die "no such profile '$_cs_n'"
+    if [ "${2:-}" = "--secrets" ]; then
+        need_root; cat "$_cs_f"
+    else
+        sed -E 's/^([[:space:]]*(PrivateKey|PresharedKey)[[:space:]]*=).*/\1 (hidden - use --secrets)/I' "$_cs_f"
+    fi
+}
+
+cmd_edit() {
+    need_root; load_config
+    _ce_n="${1:-}"; valid_name "$_ce_n" || die "usage: wgswitch edit <name>"
+    _ce_f=$(profile_path "$_ce_n"); [ -f "$_ce_f" ] || die "no such profile '$_ce_n'"
+    _ce_tmp="$WGS_RUN/edit-$_ce_n.conf"
+    ( umask 077; cp "$_ce_f" "$_ce_tmp" ) || die "cannot create $_ce_tmp"
+    "${EDITOR:-vi}" "$_ce_tmp"
+    if cmp -s "$_ce_f" "$_ce_tmp"; then rm -f "$_ce_tmp"; echo "no changes"; return 0; fi
+    conf_parse "$_ce_tmp"
+    if ! _ce_err=$(conf_validate); then
+        log_err "not saved: $_ce_err"
+        echo "your edit is kept in $_ce_tmp - fix it and run: wgswitch add $_ce_tmp $_ce_n --replace" >&2
+        return 1
+    fi
+    cmd_add "$_ce_tmp" "$_ce_n" --replace && rm -f "$_ce_tmp"
+}
+
+cmd_remove() {
+    need_root; load_config
+    _cr_n="${1:-}"; valid_name "$_cr_n" || die "usage: wgswitch remove <name> [--force]"
+    _cr_f=$(profile_path "$_cr_n"); [ -f "$_cr_f" ] || die "no such profile '$_cr_n'"
+    if [ "$(state_get profile)" = "$_cr_n" ] && [ "$(state_get enabled)" = 1 ] && [ "${2:-}" != "--force" ]; then
+        die "'$_cr_n' is the connected profile - disconnect or connect to another one first"
+    fi
+    rm -f "$_cr_f" && echo "removed profile '$_cr_n'"
+    awk -F "$TAB" -v n="$_cr_n" '$1 != n' "$WGS_RESULTS" > "$WGS_RESULTS.tmp" 2>/dev/null && mv "$WGS_RESULTS.tmp" "$WGS_RESULTS"
+    return 0
+}
+
+cmd_list() {
+    load_config
+    _cl_json=0; [ "${1:-}" = "--json" ] && _cl_json=1
+    _cl_cur=$(state_get profile); _cl_en=$(state_get enabled)
+    [ "$_cl_json" = 1 ] && printf '['
+    _cl_first=1
+    for _pf in "$CONF_DIR"/*.conf; do
+        [ -f "$_pf" ] || continue
+        _cl_n=${_pf##*/}; _cl_n=${_cl_n%.conf}
+        _cl_err=
+        if ! valid_name "$_cl_n"; then _cl_err="invalid file name (use letters, digits, . _ -)"
+        elif ! conf_parse "$_pf"; then _cl_err="unreadable"
+        else _cl_err=$(conf_validate) && _cl_err=; fi
+        _cl_act=0; [ "$_cl_n" = "$_cl_cur" ] && [ "$_cl_en" = 1 ] && _cl_act=1
+        _cl_r=$(result_of "$_cl_n")
+        _cl_st=$(printf '%s' "$_cl_r" | cut -f2); _cl_ms=$(printf '%s' "$_cl_r" | cut -f3)
+        _cl_ts=$(printf '%s' "$_cl_r" | cut -f4); _cl_dt=$(printf '%s' "$_cl_r" | cut -f5)
+        _cl_ep=; [ -z "$_cl_err" ] && _cl_ep=$(ep_display "$P_EP_HOST" "$P_EP_PORT")
+        if [ "$_cl_json" = 1 ]; then
+            [ "$_cl_first" = 1 ] || printf ','
+            printf '{"name":"%s","endpoint":"%s","valid":%s,"error":"%s","active":%s,"test":{"status":"%s","ms":%s,"ts":%s,"detail":"%s"}}' \
+                "$(json_str "$_cl_n")" "$(json_str "$_cl_ep")" "$([ -z "$_cl_err" ] && echo true || echo false)" \
+                "$(json_str "$_cl_err")" "$([ "$_cl_act" = 1 ] && echo true || echo false)" \
+                "$(json_str "$_cl_st")" "${_cl_ms:-null}" "${_cl_ts:-null}" "$(json_str "$_cl_dt")"
+        else
+            if [ -n "$_cl_err" ]; then _cl_txt="INVALID: $_cl_err"
+            elif [ "$_cl_st" = ok ]; then _cl_txt="handshake ${_cl_ms} ms"
+            elif [ -n "$_cl_st" ]; then _cl_txt="$_cl_st${_cl_dt:+ ($_cl_dt)}"
+            else _cl_txt="not tested"; fi
+            printf '%s %-32s %-28s %s\n' "$([ "$_cl_act" = 1 ] && echo '*' || echo ' ')" "$_cl_n" "$_cl_ep" "$_cl_txt"
+        fi
+        _cl_first=0
+    done
+    [ "$_cl_json" = 1 ] && printf ']\n'
+    return 0
+}
+
+cmd_status() {
+    load_config
+    _st_json=0; [ "${1:-}" = "--json" ] && _st_json=1
+    _st_p=$(state_get profile); _st_en=$(state_get enabled); _st_ev=$(state_get event)
+    _st_rt=$(rt_get); [ -n "$_st_rt" ] || { [ "$_st_en" = 1 ] && _st_rt=unknown || _st_rt=disconnected; }
+    _st_ep=
+    if [ -n "$_st_p" ] && profile_load "$_st_p"; then _st_ep=$(ep_display "$P_EP_HOST" "$P_EP_PORT"); fi
+    # live numbers straight from the kernel; ping figures from the daemon's last check
+    _st_up=0; _st_age=-1; _st_rx=0; _st_tx=0
+    if iface_exists; then
+        _st_up=1
+        _st_h=$(latest_handshake "$IFACE"); [ "$_st_h" -gt 0 ] && _st_age=$(( $(now) - _st_h ))
+        # shellcheck disable=SC2046
+        set -- $(wg show "$IFACE" transfer 2>/dev/null | awk '{ rx += $2; tx += $3 } END { print rx + 0, tx + 0 }')
+        _st_rx=${1:-0}; _st_tx=${2:-0}
+    fi
+    _st_rtt=-; _st_loss=-; _st_hts=0
+    if [ -f "$WGS_HEALTH" ]; then
+        _st_rtt=$(sed -n 's/.* rtt=\([^ ]*\).*/\1/p' "$WGS_HEALTH")
+        _st_loss=$(sed -n 's/.* loss=\([^ ]*\).*/\1/p' "$WGS_HEALTH")
+        _st_hts=$(sed -n 's/.* ts=\([^ ]*\).*/\1/p' "$WGS_HEALTH")
+    fi
+    [ "$_st_up" = 1 ] || { _st_rtt=-; _st_loss=-; }
+    _st_pg=$(cat "$WGS_PROGRESS" 2>/dev/null)
+    _st_busy=$(cat "$WGS_STATE/busy" 2>/dev/null)
+    [ -z "$(ls "$WGS_RUN/queue" 2>/dev/null)" ] || _st_busy="${_st_busy:-queued}"
+    _st_daemon=0; [ -n "$(cat "$WGS_RUN/daemon.pid" 2>/dev/null)" ] && kill -0 "$(cat "$WGS_RUN/daemon.pid")" 2>/dev/null && _st_daemon=1
+    if [ "$_st_json" = 1 ]; then
+        printf '{"version":"%s","interface":"%s","enabled":%s,"profile":"%s","endpoint":"%s","state":"%s","killswitch":"%s",' \
+            "$WGS_VERSION" "$IFACE" "$([ "$_st_en" = 1 ] && echo true || echo false)" "$(json_str "$_st_p")" \
+            "$(json_str "$_st_ep")" "$_st_rt" "$KILLSWITCH"
+        printf '"up":%s,"handshake_age":%s,"rx":%s,"tx":%s,"rtt_ms":%s,"loss_pct":%s,"health_ts":%s,"daemon":%s,"event":"%s","test":"%s","busy":"%s"}\n' \
+            "$([ "$_st_up" = 1 ] && echo true || echo false)" "$_st_age" "$_st_rx" "$_st_tx" \
+            "$([ "$_st_rtt" = - ] && echo null || echo "$_st_rtt")" "$([ "$_st_loss" = - ] && echo null || echo "$_st_loss")" \
+            "${_st_hts:-0}" "$([ "$_st_daemon" = 1 ] && echo true || echo false)" "$(json_str "$_st_ev")" "$(json_str "$_st_pg")" "$(json_str "$_st_busy")"
+        return 0
+    fi
+    if [ "$_st_en" = 1 ]; then echo "VPN:         connected ($_st_rt)"; else echo "VPN:         disconnected - traffic goes out directly"; fi
+    echo "Profile:     ${_st_p:--}${_st_ep:+ ($_st_ep)}"
+    echo "Interface:   $IFACE ($([ "$_st_up" = 1 ] && echo up || echo down))"
+    if [ "$_st_up" = 1 ]; then
+        echo "Handshake:   $([ "$_st_age" -ge 0 ] && echo "${_st_age}s ago" || echo never)"
+        echo "Health:      RTT ${_st_rtt} ms, loss ${_st_loss}% (checked $(( $(now) - ${_st_hts:-0} ))s ago)"
+        echo "Transfer:    rx $_st_rx B, tx $_st_tx B"
+    fi
+    echo "Kill switch: $KILLSWITCH"
+    [ -n "$_st_ev" ] && echo "Last event:  $_st_ev"
+    [ -n "$_st_pg" ] && echo "Test:        $_st_pg"
+    [ -n "$_st_busy" ] && echo "Busy:        $_st_busy"
+    [ "$_st_daemon" = 1 ] || echo "warning: the wgswitch service is not running (/etc/init.d/wgswitch start) - no health checks or kill switch" >&2
+    return 0
+}
+
+cmd_test() {
+    need_root; load_config
+    _ct_bg=0
+    if [ "${1:-}" = "--bg" ]; then _ct_bg=1; shift; fi
+    if [ $# -eq 0 ]; then
+        # shellcheck disable=SC2046
+        set -- $(profiles)
+    fi
+    [ $# -gt 0 ] || die "no profiles in $CONF_DIR"
+    for _n in "$@"; do valid_name "$_n" && [ -f "$(profile_path "$_n")" ] || die "no such profile '$_n'"; done
+    if [ "$_ct_bg" = 1 ]; then enqueue test "$@"; return; fi
+    ( test_run "$@" )
+}
+
+cmd_best() {
+    load_config
+    _cb=$(best_result "") ; [ -n "$_cb" ] || die "no successful test results yet - run 'wgswitch test'"
+    echo "$_cb"
+}
+
+# ---------------------------------------------------------------------------
+# daemon: health checks + kill switch. Runs under procd (/etc/init.d/wgswitch)
+# ---------------------------------------------------------------------------
+killswitch_act() {  # caller holds the main lock
+    _ka_cur=$(state_get profile)
+    case "$KILLSWITCH" in
+        block)
+            rt_set blocked
+            log_warn "kill switch (block): tunnel '$_ka_cur' is down - no traffic until it recovers; retrying the connection"
+            ifup "$IFACE" 2>/dev/null
+            ;;
+        fastest)
+            rt_set failover
+            _ka_c=$(ranked "$_ka_cur" | head -n "$FAILOVER_CANDIDATES" | tr '\n' ' ')
+            if [ -z "$_ka_c" ]; then
+                rt_set blocked; log_warn "kill switch (fastest): no other profiles to try - blocking"; ifup "$IFACE" 2>/dev/null; return
+            fi
+            log_warn "kill switch (fastest): tunnel '$_ka_cur' is down - testing: $_ka_c"
+            # Don't sit behind a long user-started test: wait at most 30 s for
+            # the probe interface, otherwise block this round and retry.
+            # shellcheck disable=SC2086
+            ( TEST_LOCK_WAIT=30; test_run $_ka_c ) >/dev/null 2>&1
+            _ka_best=
+            _ka_bms=
+            for _n in $_ka_c; do
+                _ka_r=$(result_of "$_n")
+                [ "$(printf '%s' "$_ka_r" | cut -f2)" = ok ] || continue
+                _ka_ms=$(printf '%s' "$_ka_r" | cut -f3)
+                if [ -z "$_ka_bms" ] || [ "$_ka_ms" -lt "$_ka_bms" ]; then _ka_best=$_n; _ka_bms=$_ka_ms; fi
+            done
+            if [ -n "$_ka_best" ] && do_connect "$_ka_best" 0; then
+                state_set event "kill switch: '$_ka_cur' failed, switched to '$_ka_best' at $(date '+%F %T')"
+                log_warn "kill switch (fastest): switched '$_ka_cur' -> '$_ka_best' (${_ka_bms} ms)"
+            else
+                rt_set blocked; log_err "kill switch (fastest): no candidate answered - blocking, will retry"
+                ifup "$IFACE" 2>/dev/null
+            fi
+            ;;
+        direct)
+            do_disconnect 1 "kill switch: '$_ka_cur' failed, fell back to direct at $(date '+%F %T')"
+            rt_set fallback-direct
+            ;;
+    esac
+}
+
+cmd_daemon() {
+    need_root; load_config
+    echo $$ > "$WGS_RUN/daemon.pid"
+    trap ':' HUP USR1   # just interrupt the sleep below
+    trap 'rm -f "$WGS_RUN/daemon.pid"; exit 0' INT TERM
+    _dm_fails=0
+    _dm_loops=${WGSWITCH_DAEMON_LOOPS:-0}   # tests only: stop after N rounds
+    log_info "service started (interface $IFACE, kill switch $KILLSWITCH, check every ${INTERVAL}s)"
+    while :; do
+        load_config
+        daemon_queue
+        if [ "$(state_get enabled)" = 1 ]; then
+            if lock_try main; then
+                if health_check; then
+                    [ "$_dm_fails" -gt 0 ] || [ "$(rt_get)" != ok ] && log_info "tunnel healthy (handshake ${H_AGE}s ago, RTT ${H_RTT:-?} ms)"
+                    _dm_fails=0; rt_set ok
+                else
+                    _dm_fails=$((_dm_fails + 1))
+                    [ "$(rt_get)" = blocked ] || rt_set degraded
+                    log_warn "health check failed ($_dm_fails/$FAIL_THRESHOLD): up=$H_UP handshake_age=${H_AGE}s loss=${H_LOSS}%"
+                    if [ "$_dm_fails" -ge "$FAIL_THRESHOLD" ]; then
+                        killswitch_act
+                        _dm_fails=0
+                    fi
+                fi
+                lock_release main
+            fi
+        else
+            [ "$(rt_get)" = fallback-direct ] || rt_set disconnected
+            _dm_fails=0
+        fi
+        if [ "$_dm_loops" -gt 0 ]; then
+            _dm_loops=$((_dm_loops - 1)); [ "$_dm_loops" -gt 0 ] || { wait; rm -f "$WGS_RUN/daemon.pid"; return 0; }
+        fi
+        sleep "$INTERVAL" &
+        wait $! 2>/dev/null
+        kill $! 2>/dev/null
+    done
+}
+
+# ---------------------------------------------------------------------------
+_cmd="${1:-help}"; [ $# -gt 0 ] && shift
+case "$_cmd" in
+    list|ls) cmd_list "$@" ;;
+    show) cmd_show "$@" ;;
+    add|import) cmd_add "$@" ;;
+    edit) cmd_edit "$@" ;;
+    remove|rm|delete) cmd_remove "$@" ;;
+    connect|up) cmd_connect "$@" ;;
+    reconnect) cmd_reconnect "$@" ;;
+    disconnect|down) cmd_disconnect "$@" ;;
+    status) cmd_status "$@" ;;
+    test) cmd_test "$@" ;;
+    best) cmd_best ;;
+    killswitch|ks) cmd_killswitch "$@" ;;
+    daemon) cmd_daemon ;;
+    version|--version) echo "wgswitch $WGS_VERSION" ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; exit 2 ;;
+esac
