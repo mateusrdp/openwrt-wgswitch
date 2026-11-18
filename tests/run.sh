@@ -304,12 +304,15 @@ W add "$(mkconf A 10.0.0.1)" A
 W connect --best --no-hook; rc 0
 has "$OUT" "testing 1 profile(s)"; has "$OUT" "A	ok"
 
-t "default kill switch is fastest, with fallback direct"
+t "kill switch modes: default fastest-block, 'fastest' alias, bad mode refused"
 setup
 U delete wgswitch.main.killswitch
-W killswitch; eq "$OUT" fastest
-grep -q "option killswitch 'fastest'" "$ROOT/wgswitch/files/wgswitch.config" && ok || bad "package default config isn't fastest"
-grep -q "option fallback 'direct'" "$ROOT/wgswitch/files/wgswitch.config" && ok || bad "package default fallback isn't direct"
+W killswitch; eq "$OUT" fastest-block
+grep -q "option killswitch 'fastest-block'" "$ROOT/wgswitch/files/wgswitch.config" && ok || bad "package default config isn't fastest-block"
+W killswitch fastest; eq "$(U get wgswitch.main.killswitch)" fastest-block
+U set wgswitch.main.killswitch=fastest; W killswitch; eq "$OUT" fastest-block "(old config value)"
+W killswitch fastest-direct; eq "$(U get wgswitch.main.killswitch)" fastest-direct
+W killswitch sometimes; rc 1
 
 t "connect: handshake OK but no traffic -> exit 4 and a warning"
 setup; reach 10.0.0.1; nodata 10.0.0.1
@@ -317,7 +320,7 @@ W add "$(mkconf ND 10.0.0.1)" ND
 W connect ND; rc 4
 has "$OUT" "nothing came back through the tunnel"
 
-t "kill switch fastest: skips a server that handshakes but passes no traffic"
+t "kill switch fastest-block: skips a server that handshakes but passes no traffic"
 setup
 reach 10.0.0.1; reach 10.0.0.2 0; reach 10.0.0.3 300; nodata 10.0.0.2
 W add "$(mkconf A 10.0.0.1)" A; W add "$(mkconf NODATA 10.0.0.2)" NODATA; W add "$(mkconf GOOD 10.0.0.3)" GOOD
@@ -328,11 +331,11 @@ eq "$(U get wgswitch.state.profile)" GOOD "(NODATA handshakes fastest but must b
 eq "$(U get wgswitch.state.enabled)" 1
 hasnt "$(cat "$FAKE/log/calls")" "hook"
 
-t "kill switch fastest: nothing works -> fallback direct (default)"
+t "kill switch fastest-direct: nothing works -> direct"
 setup
 reach 10.0.0.1; reach 10.0.0.2; nodata 10.0.0.2
 W add "$(mkconf A 10.0.0.1)" A; W add "$(mkconf NODATA 10.0.0.2)" NODATA; W add "$(mkconf DEAD 10.0.0.99)" DEAD
-W connect A; W killswitch fastest; : > "$FAKE/log/calls"
+W connect A; W killswitch fastest-direct; : > "$FAKE/log/calls"
 kill_live 10.0.0.1
 WGSWITCH_DAEMON_LOOPS=3 W daemon
 eq "$(U get wgswitch.state.enabled)" 0 "(fell back to direct)"
@@ -340,11 +343,11 @@ has "$(cat "$FAKE/log/calls")" "hook disconnect"
 eq "$(cut -d' ' -f1 "$FAKE/state/runtime")" fallback-direct
 has "$(U get wgswitch.state.event)" "no other server works"
 
-t "kill switch fastest: nothing works, fallback block -> stays on the old server"
+t "kill switch fastest-block: nothing works -> blocks on the old server, never direct"
 setup
 reach 10.0.0.1; reach 10.0.0.2; nodata 10.0.0.2
-W add "$(mkconf A 10.0.0.1)" A; W add "$(mkconf NODATA 10.0.0.2)" NODATA
-W connect A; W killswitch fastest; U set wgswitch.main.fallback=block; : > "$FAKE/log/calls"
+W add "$(mkconf A 10.0.0.1)" A; W add "$(mkconf NODATA 10.0.0.2)" NODATA; W add "$(mkconf DEAD 10.0.0.99)" DEAD
+W connect A; W killswitch fastest-block; : > "$FAKE/log/calls"
 kill_live 10.0.0.1
 WGSWITCH_DAEMON_LOOPS=3 W daemon
 eq "$(U get wgswitch.state.enabled)" 1; eq "$(U get wgswitch.state.profile)" A

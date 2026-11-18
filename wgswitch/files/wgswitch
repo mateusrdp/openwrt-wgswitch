@@ -35,12 +35,13 @@ Testing:
   best                          print the fastest profile from the last test
 
 Kill switch (what happens if the connected tunnel dies):
-  killswitch [fastest|block|direct]   show or set the mode
-    fastest  (default) switch to the fastest other profile that passes
-             traffic; if none does, apply the fallback (option 'fallback':
-             direct = disconnect (default), block = no internet)
-    block    keep the tunnel as the only path: no internet until it recovers
-    direct   disconnect and let traffic go out directly
+  killswitch [MODE]                   show or set the mode
+    block           stay on this server: no internet until it recovers
+    fastest-block   (default) switch to the fastest other server that
+                    passes traffic; if none does, no internet
+    fastest-direct  switch to the fastest other server that passes
+                    traffic; if none does, go out directly
+    direct          disconnect and let traffic go out directly
 
 Configuration: /etc/config/wgswitch (uci), or LuCI > Network > VPN.
 EOF
@@ -230,9 +231,9 @@ cmd_killswitch() {
     load_config
     if [ -z "${1:-}" ]; then echo "$KILLSWITCH"; return 0; fi
     need_root
-    case "$1" in block|fastest|direct) ;; *) die "mode must be fastest, block or direct" ;; esac
-    uci set "wgswitch.main.killswitch=$1"; uci commit wgswitch
-    echo "kill switch: $1"
+    _ck_m=$(ks_mode "$1") || die "mode must be block, fastest-block, fastest-direct or direct"
+    uci set "wgswitch.main.killswitch=$_ck_m"; uci commit wgswitch
+    echo "kill switch: $_ck_m"
 }
 
 cmd_add() {
@@ -423,18 +424,18 @@ killswitch_act() {  # caller holds the main lock
             log_warn "kill switch (block): tunnel '$_ka_cur' is down - no traffic until it recovers; retrying the connection"
             ifup "$IFACE" 2>/dev/null
             ;;
-        fastest)
+        fastest-block|fastest-direct)
             # Snapshot first: a candidate that handshakes but passes no
-            # traffic stays applied, and 'block' must go back to the original.
+            # traffic stays applied, and blocking must go back to the original.
             uci export network > "$WGS_RUN/killswitch.bak" 2>/dev/null
             if failover_fastest "$_ka_cur"; then rm -f "$WGS_RUN/killswitch.bak"; return 0; fi
-            # Last resort: nothing else works.
-            if [ "$FALLBACK" = block ]; then
-                log_err "kill switch (fastest): no other server works - fallback 'block': staying on '$_ka_cur', no traffic until it recovers"
+            # Last resort: no other server works.
+            if [ "$KILLSWITCH" = fastest-block ]; then
+                log_err "kill switch (fastest-block): no other server works - blocking all traffic on '$_ka_cur' until a tunnel works again"
                 if [ -s "$WGS_RUN/killswitch.bak" ]; then
                     uci import network < "$WGS_RUN/killswitch.bak" 2>/dev/null && uci commit network
                 fi
-                state_set profile "$_ka_cur" enabled 1
+                state_set profile "$_ka_cur" enabled 1 event "kill switch: '$_ka_cur' failed and no other server works - blocking at $(date '+%F %T')"
                 ifup "$IFACE" 2>/dev/null
                 rt_set blocked
             else
