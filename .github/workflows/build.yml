@@ -71,14 +71,21 @@ jobs:
         id: sdk
         run: |
           # The packages are architecture-independent (PKGARCH:=all), so any
-          # 25.12 SDK builds them for every device. Image tag naming has
-          # varied between releases - use the first one that exists.
+          # 25.12 SDK builds them for every device. gh-action-sdk (v11+) pulls
+          # ghcr.io/openwrt/sdk:$ARCH, so check that registry - not Docker Hub,
+          # where tags can differ. Image tag naming has varied between
+          # releases: use the first candidate that exists.
+          token=$(curl -fsS "https://ghcr.io/token?scope=repository:openwrt/sdk:pull" | jq -r .token)
+          accept='application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
           for t in "x86_64-${OPENWRT_VERSION}" "x86_64-v${OPENWRT_VERSION}" "x86_64-openwrt-${OPENWRT_SERIES}" "x86_64-${OPENWRT_SERIES}"; do
-            if curl -fsS "https://hub.docker.com/v2/repositories/openwrt/sdk/tags/$t" >/dev/null 2>&1; then
-              echo "Using openwrt/sdk:$t"; echo "arch=$t" >> "$GITHUB_OUTPUT"; exit 0
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" -H "Accept: $accept" \
+              "https://ghcr.io/v2/openwrt/sdk/manifests/$t")
+            echo "ghcr.io/openwrt/sdk:$t -> HTTP $code"
+            if [ "$code" = 200 ]; then
+              echo "Using ghcr.io/openwrt/sdk:$t"; echo "arch=$t" >> "$GITHUB_OUTPUT"; exit 0
             fi
           done
-          echo "::error::no openwrt/sdk image found for ${OPENWRT_VERSION}"; exit 1
+          echo "::error::no ghcr.io/openwrt/sdk image found for ${OPENWRT_VERSION}"; exit 1
 
       - name: Signing key sanity (tags only)
         if: startsWith(github.ref, 'refs/tags/')
@@ -90,7 +97,7 @@ jobs:
           diff -q /tmp/derived.pem keys/wgswitch.pem || { echo "::error::APK_SIGN_KEY does not match keys/wgswitch.pem"; exit 1; }
 
       - name: Build with the OpenWrt SDK
-        uses: openwrt/gh-action-sdk@v7
+        uses: openwrt/gh-action-sdk@v11
         env:
           ARCH: ${{ steps.sdk.outputs.arch }}
           FEEDNAME: wgswitch
@@ -107,12 +114,12 @@ jobs:
           ls -la dist
           ls dist/wgswitch-*.apk dist/luci-app-wgswitch-*.apk >/dev/null
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: feed
           path: dist/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: build-logs
@@ -127,7 +134,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: feed
           path: dist
@@ -148,7 +155,7 @@ jobs:
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: feed
           path: site
@@ -165,8 +172,8 @@ jobs:
           apk update &amp;&amp; apk add wgswitch luci-app-wgswitch</pre>
           <p>Release: ${GITHUB_REF_NAME}. Source: <a href="https://github.com/${GITHUB_REPOSITORY}">${GITHUB_REPOSITORY}</a></p>
           EOF
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: site
       - id: deploy
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
