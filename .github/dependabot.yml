@@ -5,3 +5,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # One PR for all action updates: the artifact upload/download actions and
+    # the Pages upload/deploy actions only work in matching pairs, and several
+    # of them only run on release tags, so they're tested together by tagging.
+    groups:
+      github-actions:
+        patterns: [ "*" ]
