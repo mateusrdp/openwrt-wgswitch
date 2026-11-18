@@ -64,7 +64,8 @@ is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 load_config() {
     IFACE=$(cfg interface wg0)
     CONF_DIR=$(cfg conf_dir /etc/wireguard)
-    KILLSWITCH=$(cfg killswitch block)
+    KILLSWITCH=$(cfg killswitch fastest)
+    FALLBACK=$(cfg fallback direct)
     ROUTE_MODE=$(cfg route_mode split)
     INTERVAL=$(cfg check_interval 15)
     FAIL_THRESHOLD=$(cfg fail_threshold 3)
@@ -86,7 +87,8 @@ load_config() {
     [ "${#IFACE}" -le 15 ] || die "interface name '$IFACE' is longer than 15 characters"
     case "$PROBE_IF" in ''|*[!A-Za-z0-9_]*) die "invalid probe_interface '$PROBE_IF'" ;; esac
     [ "$PROBE_IF" != "$IFACE" ] || die "probe_interface must differ from interface"
-    case "$KILLSWITCH" in block|fastest|direct) ;; *) log_warn "unknown killswitch '$KILLSWITCH', using block"; KILLSWITCH=block ;; esac
+    case "$KILLSWITCH" in block|fastest|direct) ;; *) log_warn "unknown killswitch '$KILLSWITCH', using fastest"; KILLSWITCH=fastest ;; esac
+    case "$FALLBACK" in direct|block) ;; *) log_warn "unknown fallback '$FALLBACK', using direct"; FALLBACK=direct ;; esac
     case "$ROUTE_MODE" in split|allowed_ips|none) ;; *) log_warn "unknown route_mode '$ROUTE_MODE', using split"; ROUTE_MODE='split' ;; esac
     for _v in INTERVAL FAIL_THRESHOLD HS_MAX CONNECT_TIMEOUT PROBE_TIMEOUT FAILOVER_CANDIDATES HOOK_TIMEOUT PROBE_TABLE PROBE_PRIO; do
         eval "_x=\$$_v"

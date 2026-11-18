@@ -32,7 +32,7 @@ setup() {
     mkdir -p "$FAKE/uci" "$FAKE/wg" "$FAKE/net" "$FAKE/log" "$FAKE/wireguard" "$FAKE/run" "$FAKE/state" "$FAKE/etc"
     : > "$FAKE/log/calls"; : > "$FAKE/log/keyfiles"; : > "$FAKE/log/syslog"
     printf 'default via 192.168.10.1 dev br-lan.1 proto static\ndefault dev vpn proto static\n' > "$FAKE/net/routes4"
-    : > "$FAKE/net/routes6"; : > "$FAKE/net/rules"; : > "$FAKE/net/tables"; : > "$FAKE/net/reachable"; : > "$FAKE/net/dns"
+    : > "$FAKE/net/routes6"; : > "$FAKE/net/rules"; : > "$FAKE/net/tables"; : > "$FAKE/net/reachable"; : > "$FAKE/net/dns"; : > "$FAKE/net/nodata"
     cat > "$FAKE/uci/wgswitch" <<EOF
 {"main": {".type": "wgswitch", "interface": "vpn", "conf_dir": "$FAKE/wireguard", "killswitch": "block",
   "check_interval": "1", "fail_threshold": "2", "probe_timeout": "1", "connect_timeout": "2",
@@ -59,6 +59,11 @@ mkconf() {
     printf '%s' "$FAKE/in-$_n.conf"
 }
 reach() { printf '%s %s\n' "$1" "${2:-0}" >> "$FAKE/net/reachable"; }
+nodata() { printf '%s\n' "$1" >> "$FAKE/net/nodata"; }   # handshakes, but passes no traffic
+kill_live() {  # the connected server dies: no replies, handshake goes stale
+    unreach "$1"
+    python3 -c "import json,os;p=os.environ['FAKE']+'/wg/vpn.json';d=json.load(open(p));d['hs']=1;d.pop('hs_due',None);json.dump(d,open(p,'w'))"
+}
 unreach() { grep -v "^$1 " "$FAKE/net/reachable" > "$FAKE/net/r.tmp"; mv "$FAKE/net/r.tmp" "$FAKE/net/reachable"; }
 
 W() {  # run wgswitch; output in $OUT, status in $RC
@@ -298,6 +303,53 @@ setup; reach 10.0.0.1
 W add "$(mkconf A 10.0.0.1)" A
 W connect --best --no-hook; rc 0
 has "$OUT" "testing 1 profile(s)"; has "$OUT" "A	ok"
+
+t "default kill switch is fastest, with fallback direct"
+setup
+U delete wgswitch.main.killswitch
+W killswitch; eq "$OUT" fastest
+grep -q "option killswitch 'fastest'" "$ROOT/wgswitch/files/wgswitch.config" && ok || bad "package default config isn't fastest"
+grep -q "option fallback 'direct'" "$ROOT/wgswitch/files/wgswitch.config" && ok || bad "package default fallback isn't direct"
+
+t "connect: handshake OK but no traffic -> exit 4 and a warning"
+setup; reach 10.0.0.1; nodata 10.0.0.1
+W add "$(mkconf ND 10.0.0.1)" ND
+W connect ND; rc 4
+has "$OUT" "nothing came back through the tunnel"
+
+t "kill switch fastest: skips a server that handshakes but passes no traffic"
+setup
+reach 10.0.0.1; reach 10.0.0.2 0; reach 10.0.0.3 300; nodata 10.0.0.2
+W add "$(mkconf A 10.0.0.1)" A; W add "$(mkconf NODATA 10.0.0.2)" NODATA; W add "$(mkconf GOOD 10.0.0.3)" GOOD
+W connect A; W killswitch fastest; : > "$FAKE/log/calls"
+kill_live 10.0.0.1
+WGSWITCH_DAEMON_LOOPS=3 W daemon
+eq "$(U get wgswitch.state.profile)" GOOD "(NODATA handshakes fastest but must be skipped)"
+eq "$(U get wgswitch.state.enabled)" 1
+hasnt "$(cat "$FAKE/log/calls")" "hook"
+
+t "kill switch fastest: nothing works -> fallback direct (default)"
+setup
+reach 10.0.0.1; reach 10.0.0.2; nodata 10.0.0.2
+W add "$(mkconf A 10.0.0.1)" A; W add "$(mkconf NODATA 10.0.0.2)" NODATA; W add "$(mkconf DEAD 10.0.0.99)" DEAD
+W connect A; W killswitch fastest; : > "$FAKE/log/calls"
+kill_live 10.0.0.1
+WGSWITCH_DAEMON_LOOPS=3 W daemon
+eq "$(U get wgswitch.state.enabled)" 0 "(fell back to direct)"
+has "$(cat "$FAKE/log/calls")" "hook disconnect"
+eq "$(cut -d' ' -f1 "$FAKE/state/runtime")" fallback-direct
+has "$(U get wgswitch.state.event)" "no other server works"
+
+t "kill switch fastest: nothing works, fallback block -> stays on the old server"
+setup
+reach 10.0.0.1; reach 10.0.0.2; nodata 10.0.0.2
+W add "$(mkconf A 10.0.0.1)" A; W add "$(mkconf NODATA 10.0.0.2)" NODATA
+W connect A; W killswitch fastest; U set wgswitch.main.fallback=block; : > "$FAKE/log/calls"
+kill_live 10.0.0.1
+WGSWITCH_DAEMON_LOOPS=3 W daemon
+eq "$(U get wgswitch.state.enabled)" 1; eq "$(U get wgswitch.state.profile)" A
+eq "$(cut -d' ' -f1 "$FAKE/state/runtime")" blocked
+hasnt "$(cat "$FAKE/log/calls")" "hook disconnect"
 
 t "interface name is configurable"
 setup; reach 10.0.0.1

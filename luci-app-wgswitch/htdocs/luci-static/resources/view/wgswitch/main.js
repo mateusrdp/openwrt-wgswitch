@@ -325,10 +325,17 @@ return view.extend({
 
 		let o = s.option(form.ListValue, 'killswitch', _('Kill switch'),
 			_('What happens when the connected tunnel stops working.'));
+		o.value('fastest', _('Fastest - switch to the fastest other server that passes traffic'));
 		o.value('block', _('Block - no internet until the tunnel recovers'));
-		o.value('fastest', _('Fastest - switch to the fastest other server that answers'));
 		o.value('direct', _('Direct - disconnect and go out without the VPN'));
-		o.default = 'block';
+		o.default = 'fastest';
+
+		o = s.option(form.ListValue, 'fallback', _('If no server works'),
+			_('Last resort for <em>Fastest</em> when no other server passes traffic.'));
+		o.value('direct', _('Direct - disconnect and go out without the VPN'));
+		o.value('block', _('Block - stay on the current server, no internet until it recovers'));
+		o.default = 'direct';
+		o.depends('killswitch', 'fastest');
 
 		o = s.option(form.Value, 'interface', _('VPN interface'),
 			_('netifd interface (and WireGuard device) that wgswitch manages, e.g. <code>wg0</code> or <code>vpn</code>. Your firewall zone should match this device.'));
