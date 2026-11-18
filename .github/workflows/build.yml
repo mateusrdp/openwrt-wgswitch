@@ -165,7 +165,7 @@ jobs:
           apk update &amp;&amp; apk add wgswitch luci-app-wgswitch</pre>
           <p>Release: ${GITHUB_REF_NAME}. Source: <a href="https://github.com/${GITHUB_REPOSITORY}">${GITHUB_REPOSITORY}</a></p>
           EOF
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: site
       - id: deploy
