@@ -90,7 +90,7 @@ jobs:
           diff -q /tmp/derived.pem keys/wgswitch.pem || { echo "::error::APK_SIGN_KEY does not match keys/wgswitch.pem"; exit 1; }
 
       - name: Build with the OpenWrt SDK
-        uses: openwrt/gh-action-sdk@v7
+        uses: openwrt/gh-action-sdk@v11
         env:
           ARCH: ${{ steps.sdk.outputs.arch }}
           FEEDNAME: wgswitch
