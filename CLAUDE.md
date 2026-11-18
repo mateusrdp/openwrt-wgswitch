@@ -21,6 +21,12 @@
 6. **Anything that changes live state holds the `main` lock; the probe
    holds `probe`.** A failed connect must restore the previous state
    (`uci export/import network`).
+7. **Every wait loop has a wall-clock bound (`now`, i.e. `date +%s`)**, on
+   top of whatever finer clock it uses. Never format large numbers with awk
+   `printf "%d"`: BusyBox caps it at 2^31-1, so `uptime_ms` froze after
+   ~24.8 days of uptime and a server that never answered hung the probe
+   forever (0.1.1 and earlier). Use `%.0f`. CI runners have minutes of
+   uptime, so CI cannot catch this class of bug by itself; write a test.
 
 ## How work flows
 

@@ -84,7 +84,7 @@ t "validation: good conf, ignored keys, redaction"
 setup
 f=$(mkconf AU-45 180.149.229.130 "PostUp = iptables -A FORWARD -j ACCEPT")
 priv=$(sed -n 's/^PrivateKey = //p' "$f")
-W add "$f" AU-45; rc 0; has "$OUT" "added profile 'AU-45'"; has "$OUT" "postup"
+W add "$f" AU-45; rc 0; has "$OUT" "added profile 'AU-45'"; has "$OUT" "postup"; hasnt "$OUT" "dns"
 eq "$(stat -c %a "$FAKE/wireguard/AU-45.conf")" 600 "(profile mode)"
 W show AU-45; rc 0; hasnt "$OUT" "$priv" "(show must hide the private key)"; has "$OUT" "(hidden"
 W show AU-45 --secrets; has "$OUT" "$priv"
@@ -260,6 +260,44 @@ W add "$(mkconf A 10.0.0.1)" A; W add "$(mkconf B 10.0.0.2)" B
 W connect --best --no-hook; rc 0
 eq "$(U get wgswitch.state.profile)" B "(fastest picked)"
 hasnt "$(cat "$FAKE/log/calls")" "hook" "(--no-hook)"
+
+t "clock: uptime_ms is exact past 24.8 days of uptime (BusyBox awk %d caps at 2^31-1)"
+setup
+printf '5000000.12 9999.00\n' > "$FAKE/uptime"
+ms=$(PATH="$SHIMS:$BBDIR:/usr/bin:/bin" WGSWITCH_UPTIME_FILE="$FAKE/uptime" "$BB" ash -c ". '$ROOT/wgswitch/files/lib.sh'; uptime_ms")
+eq "$ms" 5000000120
+
+t "probe: a dead server times out even if the uptime clock is frozen"
+setup
+printf '5000000.12 9999.00\n' > "$FAKE/uptime"      # never advances
+W add "$(mkconf DEAD 10.0.0.99)" DEAD
+t0=$(date +%s)
+WGSWITCH_UPTIME_FILE="$FAKE/uptime"; export WGSWITCH_UPTIME_FILE
+W test DEAD
+unset WGSWITCH_UPTIME_FILE
+el=$(( $(date +%s) - t0 ))
+has "$OUT" "DEAD	fail	timeout"
+[ "$el" -le 6 ] && ok || bad "test of one dead server took ${el}s with probe_timeout=1 (must be bounded by the wall clock)"
+
+t "probe: handshake time is measured, not 0 ms"
+setup; reach 10.0.0.1 300
+W add "$(mkconf SLOW 10.0.0.1)" SLOW
+W test SLOW
+ms=$(printf '%s\n' "$OUT" | sed -n 's/^SLOW	ok	\([0-9]*\) ms.*/\1/p')
+[ -n "$ms" ] && [ "$ms" -ge 250 ] && ok || bad "300 ms server measured as '${ms}' ms"
+
+t "provider DNS lines are ignored silently; scripts like PostUp still warn"
+setup
+W add "$(mkconf A 10.0.0.1)" A
+hasnt "$OUT" "dns"
+W add "$(mkconf B 10.0.0.2 'PostUp = echo hi')" B
+has "$OUT" "postup"; hasnt "$OUT" "dns"
+
+t "connect --best shows the test progress"
+setup; reach 10.0.0.1
+W add "$(mkconf A 10.0.0.1)" A
+W connect --best --no-hook; rc 0
+has "$OUT" "testing 1 profile(s)"; has "$OUT" "A	ok"
 
 t "interface name is configurable"
 setup; reach 10.0.0.1
