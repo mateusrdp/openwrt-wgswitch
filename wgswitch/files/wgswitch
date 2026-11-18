@@ -183,8 +183,11 @@ cmd_connect() {
     fi
     load_config
     if [ "$_cc_best" = 1 ]; then
+        # Show the test's progress (on stderr, so scripts parsing stdout are
+        # unaffected): with many profiles this takes a while.
+        log_info "testing $(profiles | wc -l) profile(s), up to ${PROBE_TIMEOUT}s each..."
         # shellcheck disable=SC2046
-        ( test_run $(profiles) ) >/dev/null || die "test failed"
+        ( test_run $(profiles) ) >&2 || die "test failed"
         _cc_name=$(best_result "") ; [ -n "$_cc_name" ] || die "no profile answered the test"
     fi
     [ -n "$_cc_name" ] || die "usage: wgswitch connect <name> | --best  [--no-hook] [--bg]"

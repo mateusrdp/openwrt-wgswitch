@@ -127,8 +127,17 @@ lock_release() { rm -rf "$WGS_RUN/$1.lock" 2>/dev/null || true; }
 # small utilities
 # ---------------------------------------------------------------------------
 now() { date +%s; }
-uptime_ms() { awk '{ printf "%d", $1 * 1000 }' /proc/uptime; }
-nap() { usleep "$1" 2>/dev/null || sleep 1; }   # nap <microseconds>
+# Milliseconds since boot. NOT printf "%d": BusyBox awk caps %d at 2^31-1,
+# which /proc/uptime*1000 passes after ~24.8 days - the clock then froze,
+# every probe measured "0 ms" and a server that never answered hung the test
+# forever. %.0f is exact for any realistic uptime.
+uptime_ms() { awk '{ printf "%.0f", $1 * 1000 }' "${WGSWITCH_UPTIME_FILE:-/proc/uptime}"; }
+# nap <microseconds>: sub-second where possible. OpenWrt 25.12's BusyBox has
+# no usleep; its sleep accepts fractions when built with FLOAT_SLEEP.
+nap() {
+    sleep "$(awk -v u="$1" 'BEGIN { printf "%.3f", u / 1000000 }')" 2>/dev/null \
+        || usleep "$1" 2>/dev/null || sleep 1
+}
 
 # run_timeout <seconds> <cmd...> : runs cmd, kills it after N seconds.
 # Returns cmd's status, or 124 on timeout.
@@ -190,6 +199,7 @@ conf_parse() {
                 if (k == "privatekey") print "PRIV\t" v
                 else if (k == "address") print "ADDR\t" v
                 else if (k == "mtu") print "MTU\t" v
+                else if (k == "dns") { }   # expected in provider configs; DNS is left to the router
                 else print "IGN\t" k
             } else if (sec == "p" && peers == 1) {
                 if (k == "publickey") print "PUB\t" v
@@ -518,8 +528,11 @@ probe_one() {
         wg set "$PROBE_IF" peer "$P_PUB" endpoint "$_po_ep" persistent-keepalive 1 2>/dev/null
     fi
     _po_lim=$(( _po_t0 + PROBE_TIMEOUT * 1000 ))
+    # Second, independent bound on the wall clock: no clock bug may ever
+    # make this loop endless again.
+    _po_deadline=$(( $(now) + PROBE_TIMEOUT + 1 ))
     _po_res="fail timeout"
-    while [ "$(uptime_ms)" -le "$_po_lim" ]; do
+    while [ "$(uptime_ms)" -le "$_po_lim" ] && [ "$(now)" -le "$_po_deadline" ]; do
         if [ "$(latest_handshake "$PROBE_IF")" -gt 0 ]; then
             _po_res="ok $(( $(uptime_ms) - _po_t0 ))"; break
         fi
