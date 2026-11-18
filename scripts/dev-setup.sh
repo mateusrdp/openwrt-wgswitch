@@ -8,9 +8,10 @@
 #
 #   1. activates the secret-guard pre-commit hook. core.hooksPath is
 #      per-clone git config, so a fresh clone does NOT have it until this runs
-#   2. makes sure the tools the checks need are present
-#      (busybox, shellcheck, jq, node, python3), installing via apt if possible
-#   3. prints what's missing, if anything
+#   2. checks for the tools the checks need (busybox, shellcheck, jq, node,
+#      python3). It installs missing ones with apt ONLY when already running
+#      as root (e.g. a disposable sandbox). It never uses sudo: on your own
+#      machine it just prints the install command.
 # =============================================================================
 cd "$(git rev-parse --show-toplevel 2>/dev/null || dirname "$0")" || exit 0
 
@@ -20,14 +21,18 @@ chmod +x .githooks/pre-commit scripts/*.sh tests/*.sh tests/shims/fake.py \
 
 need=
 for t in busybox shellcheck jq; do command -v "$t" >/dev/null 2>&1 || need="$need $t"; done
-if [ -n "$need" ] && command -v apt-get >/dev/null 2>&1; then
-    SUDO=; [ "$(id -u)" = 0 ] || SUDO=sudo
+if [ -n "$need" ] && [ "$(id -u)" = 0 ] && command -v apt-get >/dev/null 2>&1; then
     # shellcheck disable=SC2086  # $need is a word list on purpose
-    { $SUDO apt-get install -y -q $need || { $SUDO apt-get update -q && $SUDO apt-get install -y -q $need; }; } >/dev/null 2>&1
+    { apt-get install -y -q $need || { apt-get update -q && apt-get install -y -q $need; }; } >/dev/null 2>&1
 fi
 
 missing=
 for t in busybox shellcheck jq node python3; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done
 if [ "$(git config core.hooksPath)" = .githooks ]; then hook=active; else hook=NOT-ACTIVE; fi
-echo "dev-setup: secret-guard hook $hook${missing:+; missing tools:$missing}"
+echo "dev-setup: secret-guard hook $hook"
+if [ -n "$missing" ]; then
+    echo "dev-setup: missing tools for the local checks:$missing"
+    pkgs=$(printf '%s' "$missing" | sed 's/ node/ nodejs/')
+    echo "           install them yourself if you want to run the checks locally, e.g.: sudo apt install$pkgs"
+fi
 exit 0
