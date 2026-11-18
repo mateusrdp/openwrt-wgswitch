@@ -87,7 +87,10 @@ do_connect() {  # do_connect <name> <run_hook 0|1>
     state_set profile "$1" enabled 1 event "connected to $1 at $(date '+%F %T')"
     rt_set ok
     log_info "connected to '$1'"
-    if [ "$_dc_prev_en" != 1 ] && [ "$2" = 1 ]; then
+    # Every connect you ask for runs the hook (idempotent 'on'), so another
+    # router that drifted out of step is put right. Kill-switch failovers
+    # pass 0: routing already points at this box.
+    if [ "$2" = 1 ]; then
         run_hook connect || { log_warn "tunnel is up, but the connect hook failed"; return 3; }
     fi
     # A handshake only proves the server accepts the key. Check that traffic
@@ -479,6 +482,17 @@ failover_fastest() {
     return 1
 }
 
+# hook_sync: tell the hook the current state (service start), in case the
+# other side was changed while wgswitch wasn't looking.
+hook_sync() {
+    [ -n "$HOOK" ] || return 0
+    lock_wait main 120 || { log_warn "hook sync skipped: busy"; return 0; }
+    if [ "$(state_get enabled)" = 1 ]; then _hs_a=connect; else _hs_a=disconnect; fi
+    log_info "syncing the hook with the current state ($_hs_a)"
+    run_hook "$_hs_a" || log_warn "hook sync ($_hs_a) failed - will retry at the next connect/disconnect or service start"
+    lock_release main
+}
+
 cmd_daemon() {
     need_root; load_config
     echo $$ > "$WGS_RUN/daemon.pid"
@@ -487,6 +501,7 @@ cmd_daemon() {
     _dm_fails=0
     _dm_loops=${WGSWITCH_DAEMON_LOOPS:-0}   # tests only: stop after N rounds
     log_info "service started (interface $IFACE, kill switch $KILLSWITCH, check every ${INTERVAL}s)"
+    hook_sync
     while :; do
         load_config
         daemon_queue

@@ -137,8 +137,12 @@ A `disconnect` you ask for never triggers the kill switch.
 ## Hook
 
 `option hook '/etc/wgswitch/hook.sh'` - an executable called with
-`connect` (after connecting from a disconnected state) or `disconnect`
-(before disconnecting). Environment: `WGSWITCH_ACTION`,
+`connect` (after every connect you ask for, including switching servers)
+or `disconnect` (before disconnecting), and once with the current state
+when the service starts, so the other side is put back in step if it was
+changed by hand. Kill-switch failovers to another server don't call it
+(routing already points here). `connect` and `disconnect` should therefore
+be idempotent. Environment: `WGSWITCH_ACTION`,
 `WGSWITCH_INTERFACE`, `WGSWITCH_PROFILE`. A non-zero exit is reported (exit
 status 3) but doesn't undo the tunnel change. Example: a VPN box that sits
 behind another router, which has to start or stop routing clients to it:

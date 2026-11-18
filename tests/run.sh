@@ -60,6 +60,7 @@ mkconf() {
 }
 reach() { printf '%s %s\n' "$1" "${2:-0}" >> "$FAKE/net/reachable"; }
 nodata() { printf '%s\n' "$1" >> "$FAKE/net/nodata"; }   # handshakes, but passes no traffic
+calls_run() { sed '1{/^hook \(connect\|disconnect\) /d}' "$FAKE/log/calls"; }  # minus the service-start hook sync
 kill_live() {  # the connected server dies: no replies, handshake goes stale
     unreach "$1"
     python3 -c "import json,os;p=os.environ['FAKE']+'/wg/vpn.json';d=json.load(open(p));d['hs']=1;d.pop('hs_due',None);json.dump(d,open(p,'w'))"
@@ -131,11 +132,12 @@ eq "$(U get network.vpn_def4_lo.target)" 0.0.0.0/1; eq "$(U get network.vpn_def4
 eq "$(U get network.vpn_def6_lo.target)" ::/1
 has "$(cat "$FAKE/log/calls")" "hook connect profile=A iface=vpn"
 
-t "switch: connect B while on A - no hook, A replaced"
+t "switch: connect B while on A - hook re-runs connect, A replaced"
 : > "$FAKE/log/calls"
 W connect B; rc 0
 eq "$(U get network.vpn_peer.endpoint_host)" 10.0.0.2; eq "$(U get wgswitch.state.profile)" B
-hasnt "$(cat "$FAKE/log/calls")" "hook" "(already connected: routing hook must not re-run)"
+has "$(cat "$FAKE/log/calls")" "hook connect profile=B" "(every connect re-asserts routing)"
+hasnt "$(cat "$FAKE/log/calls")" "hook disconnect"
 has "$(cat "$FAKE/log/calls")" "ifup vpn"
 eq "$(U show network | grep -c '=wireguard_vpn$')" 1 "(exactly one peer)"
 
@@ -212,7 +214,7 @@ python3 -c "import json,os;p=os.environ['FAKE']+'/wg/vpn.json';d=json.load(open(
 WGSWITCH_DAEMON_LOOPS=3 W daemon
 eq "$(U get wgswitch.state.profile)" FAST; eq "$(U get wgswitch.state.enabled)" 1
 eq "$(U get network.vpn_peer.endpoint_host)" 10.0.0.3
-hasnt "$(cat "$FAKE/log/calls")" "hook" "(failover keeps routing as is)"
+hasnt "$(calls_run)" "hook" "(failover keeps routing as is)"
 has "$(U get wgswitch.state.event)" "switched to 'FAST'"
 
 t "kill switch: direct - disconnects and runs the disconnect hook"
@@ -221,7 +223,7 @@ W add "$(mkconf A 10.0.0.1)" A; W connect A; W killswitch direct; : > "$FAKE/log
 unreach 10.0.0.1
 python3 -c "import json,os;p=os.environ['FAKE']+'/wg/vpn.json';d=json.load(open(p));d['hs']=1;json.dump(d,open(p,'w'))"
 WGSWITCH_DAEMON_LOOPS=3 W daemon
-eq "$(U get wgswitch.state.enabled)" 0; has "$(cat "$FAKE/log/calls")" "hook disconnect"
+eq "$(U get wgswitch.state.enabled)" 0; has "$(calls_run)" "hook disconnect"
 eq "$(cut -d' ' -f1 "$FAKE/state/runtime")" fallback-direct
 
 t "kill switch: block - stays connected, keeps retrying"
@@ -232,13 +234,13 @@ python3 -c "import json,os;p=os.environ['FAKE']+'/wg/vpn.json';d=json.load(open(
 WGSWITCH_DAEMON_LOOPS=3 W daemon
 eq "$(U get wgswitch.state.enabled)" 1; eq "$(U get wgswitch.state.profile)" A
 eq "$(cut -d' ' -f1 "$FAKE/state/runtime")" blocked
-hasnt "$(cat "$FAKE/log/calls")" "hook"; has "$(cat "$FAKE/log/calls")" "ifup vpn"
+hasnt "$(calls_run)" "hook"; has "$(calls_run)" "ifup vpn"
 
 t "healthy tunnel: no action"
 setup; reach 10.0.0.1
 W add "$(mkconf A 10.0.0.1)" A; W connect A; W killswitch fastest; : > "$FAKE/log/calls"
 WGSWITCH_DAEMON_LOOPS=3 W daemon
-eq "$(cat "$FAKE/log/calls")" "" "(no ifup/hook while healthy)"
+eq "$(calls_run)" "" "(no ifup/hook while healthy)"
 eq "$(cut -d' ' -f1 "$FAKE/state/runtime")" ok
 
 t "background queue: connect --bg and test --bg run in the service"
@@ -329,7 +331,7 @@ kill_live 10.0.0.1
 WGSWITCH_DAEMON_LOOPS=3 W daemon
 eq "$(U get wgswitch.state.profile)" GOOD "(NODATA handshakes fastest but must be skipped)"
 eq "$(U get wgswitch.state.enabled)" 1
-hasnt "$(cat "$FAKE/log/calls")" "hook"
+hasnt "$(calls_run)" "hook"
 
 t "kill switch fastest-direct: nothing works -> direct"
 setup
@@ -352,7 +354,16 @@ kill_live 10.0.0.1
 WGSWITCH_DAEMON_LOOPS=3 W daemon
 eq "$(U get wgswitch.state.enabled)" 1; eq "$(U get wgswitch.state.profile)" A
 eq "$(cut -d' ' -f1 "$FAKE/state/runtime")" blocked
-hasnt "$(cat "$FAKE/log/calls")" "hook disconnect"
+hasnt "$(calls_run)" "hook disconnect"
+
+t "service start syncs the hook with the state"
+setup; reach 10.0.0.1
+W add "$(mkconf A 10.0.0.1)" A; W connect A; : > "$FAKE/log/calls"
+WGSWITCH_DAEMON_LOOPS=1 W daemon
+eq "$(sed -n 1p "$FAKE/log/calls")" "hook connect profile=A iface=vpn" "(connected -> connect)"
+W disconnect; : > "$FAKE/log/calls"
+WGSWITCH_DAEMON_LOOPS=1 W daemon
+eq "$(sed -n 1p "$FAKE/log/calls")" "hook disconnect profile=A iface=vpn" "(disconnected -> disconnect)"
 
 t "interface name is configurable"
 setup; reach 10.0.0.1
