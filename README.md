@@ -15,7 +15,7 @@ switch. Comes as a CLI and a LuCI page (**Network › VPN**).
   [How the server test works](#how-the-server-test-works).
 - **Health checks** every 15 s: handshake age, plus round-trip time and
   packet loss *through* the tunnel.
-- **Kill switch** with three modes: `block`, `fastest` or `direct`.
+- **Kill switch** with four modes: `block`, `fastest-block` (default), `fastest-direct` or `direct`.
 - **Optional hook** for multi-router setups, e.g. telling another router to
   start or stop sending traffic to this one.
 
@@ -81,8 +81,11 @@ wgswitch reconnect | disconnect
 wgswitch status [--json]               server, handshake age, RTT, loss, state
 wgswitch test [name...]                handshake-test profiles (default: all)
 wgswitch best                          fastest from the last test
-wgswitch killswitch [block|fastest|direct]
+wgswitch killswitch [block|fastest-block|fastest-direct|direct]
 ```
+
+`connect` checks that traffic actually flows (a ping through the tunnel)
+after the handshake. It exits 4 if the handshake works but nothing comes back.
 
 `connect`, `reconnect`, `disconnect` and `test` accept `--bg` to hand the
 job to the background service (that's what LuCI does, so a slow connect is
@@ -120,17 +123,26 @@ through the tunnel):
 
 | mode | what happens |
 |---|---|
-| `block` | Nothing goes around the tunnel: it stays the only route, so traffic stops until it recovers. wgswitch keeps retrying the connection. Requires that your firewall has no `lan → wan` forwarding. |
-| `fastest` | Tests the best `failover_candidates` (5) other profiles, using the last results to pick the order, and connects to the fastest one that answers. If none does, behaves like `block` and retries. |
-| `direct` | Disconnects: runs the `disconnect` hook, takes the interface down, and traffic goes out directly. Stays disconnected until you connect again. |
+| `block` | *Privacy first, and you need this particular server.* Nothing goes around the tunnel: it stays the only route, so traffic stops until it recovers. wgswitch keeps retrying the connection. |
+| `fastest-block` (default) | *Privacy first, any server will do, a few interruptions are fine.* Handshake-tests the best `failover_candidates` (5) other profiles (ordered by the last results), then connects to them fastest first and keeps the first one that **passes traffic** (a server that handshakes but passes nothing is skipped). If none works, it goes back to the original server and blocks like `block`, and tries the failover again on the next failed round. Never goes direct. |
+| `fastest-direct` | *Everyday use.* Same failover as `fastest-block`, but if no server works it disconnects like `direct`. |
+| `direct` | *Staying online matters most.* Disconnects: runs the `disconnect` hook, takes the interface down, and traffic goes out directly. Stays disconnected until you connect again. |
+
+The blocking modes need a firewall with no `lan → wan` forwarding, so the
+tunnel really is the only way out. The old mode name `fastest` still works
+and means `fastest-block`.
 
 A `disconnect` you ask for never triggers the kill switch.
 
 ## Hook
 
 `option hook '/etc/wgswitch/hook.sh'` - an executable called with
-`connect` (after connecting from a disconnected state) or `disconnect`
-(before disconnecting). Environment: `WGSWITCH_ACTION`,
+`connect` (after every connect you ask for, including switching servers)
+or `disconnect` (before disconnecting), and once with the current state
+when the service starts, so the other side is put back in step if it was
+changed by hand. Kill-switch failovers to another server don't call it
+(routing already points here). `connect` and `disconnect` should therefore
+be idempotent. Environment: `WGSWITCH_ACTION`,
 `WGSWITCH_INTERFACE`, `WGSWITCH_PROFILE`. A non-zero exit is reported (exit
 status 3) but doesn't undo the tunnel change. Example: a VPN box that sits
 behind another router, which has to start or stop routing clients to it:
@@ -146,7 +158,7 @@ exec ssh -i /etc/wgswitch/hook_key -y root@192.168.1.1 "$1"   # forced-command k
 |---|---|---|
 | `interface` | `wg0` | netifd interface / WireGuard device name (max 15 chars) |
 | `conf_dir` | `/etc/wireguard` | profile folder |
-| `killswitch` | `block` | `block` \| `fastest` \| `direct` |
+| `killswitch` | `fastest-block` | `block` \| `fastest-block` \| `fastest-direct` \| `direct` |
 | `route_mode` | `split` | `split`: full-tunnel profiles get `0.0.0.0/1` + `128.0.0.0/1` (and `::/1` + `8000::/1`), keeping your default route underneath so `disconnect` restores it. `allowed_ips`: netifd's Route Allowed IPs. `none`: no routes (e.g. use pbr). |
 | `check_interval` | `15` | seconds between health checks |
 | `fail_threshold` | `3` | failed checks before the kill switch acts |

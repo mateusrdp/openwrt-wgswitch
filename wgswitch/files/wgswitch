@@ -23,6 +23,7 @@ Connection:
   connect <name>                connect (disconnects the current one first)
   connect --best                test all profiles, connect to the fastest
   connect ... --no-hook         don't run the connect hook this time
+  (connect exits 4 if the handshake works but no traffic passes)
   reconnect                     reconnect the current profile
   disconnect                    stop the VPN: traffic goes out directly
   (connect/reconnect/disconnect/test accept --bg: hand the job to the
@@ -34,10 +35,13 @@ Testing:
   best                          print the fastest profile from the last test
 
 Kill switch (what happens if the connected tunnel dies):
-  killswitch [block|fastest|direct]   show or set the mode
-    block    keep the tunnel as the only path: no internet until it recovers
-    fastest  switch to the fastest other profile that answers a test
-    direct   disconnect and let traffic go out directly
+  killswitch [MODE]                   show or set the mode
+    block           stay on this server: no internet until it recovers
+    fastest-block   (default) switch to the fastest other server that
+                    passes traffic; if none does, no internet
+    fastest-direct  switch to the fastest other server that passes
+                    traffic; if none does, go out directly
+    direct          disconnect and let traffic go out directly
 
 Configuration: /etc/config/wgswitch (uci), or LuCI > Network > VPN.
 EOF
@@ -83,8 +87,18 @@ do_connect() {  # do_connect <name> <run_hook 0|1>
     state_set profile "$1" enabled 1 event "connected to $1 at $(date '+%F %T')"
     rt_set ok
     log_info "connected to '$1'"
-    if [ "$_dc_prev_en" != 1 ] && [ "$2" = 1 ]; then
+    # Every connect you ask for runs the hook (idempotent 'on'), so another
+    # router that drifted out of step is put right. Kill-switch failovers
+    # pass 0: routing already points at this box.
+    if [ "$2" = 1 ]; then
         run_hook connect || { log_warn "tunnel is up, but the connect hook failed"; return 3; }
+    fi
+    # A handshake only proves the server accepts the key. Check that traffic
+    # actually flows: a tunnel that handshakes but passes nothing must not
+    # count as working (the kill switch relies on this).
+    if ! health_check; then
+        log_warn "'$1': handshake OK, but nothing came back through the tunnel (ping ${PING_TARGETS}: ${H_LOSS}% loss)"
+        return 4
     fi
     return 0
 }
@@ -220,9 +234,9 @@ cmd_killswitch() {
     load_config
     if [ -z "${1:-}" ]; then echo "$KILLSWITCH"; return 0; fi
     need_root
-    case "$1" in block|fastest|direct) ;; *) die "mode must be block, fastest or direct" ;; esac
-    uci set "wgswitch.main.killswitch=$1"; uci commit wgswitch
-    echo "kill switch: $1"
+    _ck_m=$(ks_mode "$1") || die "mode must be block, fastest-block, fastest-direct or direct"
+    uci set "wgswitch.main.killswitch=$_ck_m"; uci commit wgswitch
+    echo "kill switch: $_ck_m"
 }
 
 cmd_add() {
@@ -413,38 +427,70 @@ killswitch_act() {  # caller holds the main lock
             log_warn "kill switch (block): tunnel '$_ka_cur' is down - no traffic until it recovers; retrying the connection"
             ifup "$IFACE" 2>/dev/null
             ;;
-        fastest)
-            rt_set failover
-            _ka_c=$(ranked "$_ka_cur" | head -n "$FAILOVER_CANDIDATES" | tr '\n' ' ')
-            if [ -z "$_ka_c" ]; then
-                rt_set blocked; log_warn "kill switch (fastest): no other profiles to try - blocking"; ifup "$IFACE" 2>/dev/null; return
-            fi
-            log_warn "kill switch (fastest): tunnel '$_ka_cur' is down - testing: $_ka_c"
-            # Don't sit behind a long user-started test: wait at most 30 s for
-            # the probe interface, otherwise block this round and retry.
-            # shellcheck disable=SC2086
-            ( TEST_LOCK_WAIT=30; test_run $_ka_c ) >/dev/null 2>&1
-            _ka_best=
-            _ka_bms=
-            for _n in $_ka_c; do
-                _ka_r=$(result_of "$_n")
-                [ "$(printf '%s' "$_ka_r" | cut -f2)" = ok ] || continue
-                _ka_ms=$(printf '%s' "$_ka_r" | cut -f3)
-                if [ -z "$_ka_bms" ] || [ "$_ka_ms" -lt "$_ka_bms" ]; then _ka_best=$_n; _ka_bms=$_ka_ms; fi
-            done
-            if [ -n "$_ka_best" ] && do_connect "$_ka_best" 0; then
-                state_set event "kill switch: '$_ka_cur' failed, switched to '$_ka_best' at $(date '+%F %T')"
-                log_warn "kill switch (fastest): switched '$_ka_cur' -> '$_ka_best' (${_ka_bms} ms)"
-            else
-                rt_set blocked; log_err "kill switch (fastest): no candidate answered - blocking, will retry"
+        fastest-block|fastest-direct)
+            # Snapshot first: a candidate that handshakes but passes no
+            # traffic stays applied, and blocking must go back to the original.
+            uci export network > "$WGS_RUN/killswitch.bak" 2>/dev/null
+            if failover_fastest "$_ka_cur"; then rm -f "$WGS_RUN/killswitch.bak"; return 0; fi
+            # Last resort: no other server works.
+            if [ "$KILLSWITCH" = fastest-block ]; then
+                log_err "kill switch (fastest-block): no other server works - blocking all traffic on '$_ka_cur' until a tunnel works again"
+                if [ -s "$WGS_RUN/killswitch.bak" ]; then
+                    uci import network < "$WGS_RUN/killswitch.bak" 2>/dev/null && uci commit network
+                fi
+                state_set profile "$_ka_cur" enabled 1 event "kill switch: '$_ka_cur' failed and no other server works - blocking at $(date '+%F %T')"
                 ifup "$IFACE" 2>/dev/null
+                rt_set blocked
+            else
+                do_disconnect 1 "kill switch: '$_ka_cur' failed and no other server works - fell back to direct at $(date '+%F %T')"
+                rt_set fallback-direct
             fi
+            rm -f "$WGS_RUN/killswitch.bak"
             ;;
         direct)
             do_disconnect 1 "kill switch: '$_ka_cur' failed, fell back to direct at $(date '+%F %T')"
             rt_set fallback-direct
             ;;
     esac
+}
+
+# failover_fastest <current>: handshake-test the best-ranked other profiles,
+# then connect to them fastest first, keeping the first one that actually
+# passes traffic. Returns 1 if none does.
+failover_fastest() {
+    rt_set failover
+    _ff_c=$(ranked "$1" | head -n "$FAILOVER_CANDIDATES" | tr '\n' ' ')
+    [ -n "$_ff_c" ] || { log_warn "kill switch (fastest): no other profiles to try"; return 1; }
+    log_warn "kill switch (fastest): tunnel '$1' is down - testing: $_ff_c"
+    # Don't sit behind a long user-started test: wait at most 30 s for the
+    # probe interface, otherwise treat this round as "nothing answered".
+    # shellcheck disable=SC2086
+    ( TEST_LOCK_WAIT=30; test_run $_ff_c ) >/dev/null 2>&1
+    _ff_order=$(for _n in $_ff_c; do
+        _ff_r=$(result_of "$_n")
+        [ "$(printf '%s' "$_ff_r" | cut -f2)" = ok ] && printf '%s %s\n' "$(printf '%s' "$_ff_r" | cut -f3)" "$_n"
+    done | sort -n | awk '{ print $2 }')
+    for _n in $_ff_order; do
+        do_connect "$_n" 0; _ff_rc=$?
+        if [ "$_ff_rc" = 0 ]; then
+            state_set event "kill switch: '$1' failed, switched to '$_n' at $(date '+%F %T')"
+            log_warn "kill switch (fastest): switched '$1' -> '$_n'"
+            return 0
+        fi
+        log_warn "kill switch (fastest): '$_n' doesn't work either (connect exit $_ff_rc) - trying the next"
+    done
+    return 1
+}
+
+# hook_sync: tell the hook the current state (service start), in case the
+# other side was changed while wgswitch wasn't looking.
+hook_sync() {
+    [ -n "$HOOK" ] || return 0
+    lock_wait main 120 || { log_warn "hook sync skipped: busy"; return 0; }
+    if [ "$(state_get enabled)" = 1 ]; then _hs_a=connect; else _hs_a=disconnect; fi
+    log_info "syncing the hook with the current state ($_hs_a)"
+    run_hook "$_hs_a" || log_warn "hook sync ($_hs_a) failed - will retry at the next connect/disconnect or service start"
+    lock_release main
 }
 
 cmd_daemon() {
@@ -455,6 +501,7 @@ cmd_daemon() {
     _dm_fails=0
     _dm_loops=${WGSWITCH_DAEMON_LOOPS:-0}   # tests only: stop after N rounds
     log_info "service started (interface $IFACE, kill switch $KILLSWITCH, check every ${INTERVAL}s)"
+    hook_sync
     while :; do
         load_config
         daemon_queue

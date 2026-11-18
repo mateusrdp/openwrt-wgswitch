@@ -214,7 +214,9 @@ def ping_main(argv):
     target = argv[-1]
     d = dev_load(dev) if dev else None
     hs = (d or {}).get("hs", 0) or (1 if (d or {}).get("hs_due") and time.time() >= d["hs_due"] else 0)
-    ok = d is not None and d.get("endpoint") and ep_ip(d["endpoint"]) in reachable() and hs > 0
+    nodata = rd(p("net", "nodata")).split()   # handshake works, data doesn't
+    ok = d is not None and d.get("endpoint") and ep_ip(d["endpoint"]) in reachable() and hs > 0 \
+        and ep_ip(d["endpoint"]) not in nodata
     print(f"PING {target} ({target}): 56 data bytes")
     if ok:
         print(f"--- {target} ping statistics ---\n3 packets transmitted, 3 packets received, 0% packet loss")
